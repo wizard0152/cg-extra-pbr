@@ -402,6 +402,7 @@ struct InstancedVertexInput
     float3 instancePosition : INSTANCE_POSITION;
     float3 instanceScale : INSTANCE_SCALE;
     float4 instanceColor : INSTANCE_COLOR;
+    float instanceRoughness : INSTANCE_ROUGHNESS;
 };
 
 struct InstancedPixelInput
@@ -410,6 +411,7 @@ struct InstancedPixelInput
     float3 worldPosition : POSITION;
     float3 normal : NORMAL;
     float4 color : COLOR;
+    float roughness : ROUGHNESS;
 };
 
 InstancedPixelInput InstancingVS(InstancedVertexInput input)
@@ -419,6 +421,7 @@ InstancedPixelInput InstancingVS(InstancedVertexInput input)
     output.position = mul(float4(output.worldPosition, 1.0f), gInstanceViewProjection);
     output.normal = input.normal;
     output.color = input.instanceColor;
+    output.roughness = input.instanceRoughness;
     return output;
 }
 
@@ -426,7 +429,7 @@ GBufferOutput InstancingPS(InstancedPixelInput input)
 {
     GBufferOutput output;
     output.albedo = input.color;
-    output.normal = float4(normalize(input.normal), 0.34f);
+    output.normal = float4(normalize(input.normal), input.roughness);
     output.worldPosition = float4(input.worldPosition, 1.0f);
     return output;
 }

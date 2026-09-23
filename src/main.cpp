@@ -362,6 +362,8 @@ struct InstanceData
     XMFLOAT3 scale;
     float padding1 = 0.0f;
     XMFLOAT4 color;
+    float roughness = 0.34f;
+    XMFLOAT3 padding2{};
 };
 
 struct alignas(256) InstancePassConstants
@@ -416,15 +418,16 @@ private:
     bool octreeCulling_ = true;
     bool shadowsEnabled_ = true;
     bool visualizeCascades_ = false;
-    bool particlesEnabled_ = true;
+    bool particlesEnabled_ = false;
     bool vignetteEnabled_ = true;
     bool outlinesEnabled_ = true;
     bool iblEnabled_ = true;
+    bool materialGridEnabled_ = true;
     float tiling_ = 2.0f;
     float animationTime_ = 0.0f;
     XMFLOAT3 cameraPosition_{0.0f, 8.0f, -25.0f};
     float cameraYaw_ = 0.0f;
-    float cameraPitch_ = -0.12f;
+    float cameraPitch_ = 0.0f;
     std::chrono::steady_clock::time_point previousTime_{};
     float titleUpdateTime_ = 0.0f;
     uint32_t titleFrameCount_ = 0;
@@ -460,6 +463,7 @@ private:
     ComPtr<ID3D12Resource> vertexBuffer_, indexBuffer_;
     ComPtr<ID3D12Resource> tessellationVertexBuffer_;
     ComPtr<ID3D12Resource> cubeVertexBuffer_, cubeIndexBuffer_;
+    ComPtr<ID3D12Resource> sphereVertexBuffer_, sphereIndexBuffer_;
     ComPtr<ID3D12Resource> shadowMap_, shadowInstanceBuffer_;
     std::array<ComPtr<ID3D12Resource>, 2> particleBuffers_, particleCounters_;
     D3D12_VERTEX_BUFFER_VIEW vertexView_{};
@@ -467,6 +471,9 @@ private:
     D3D12_VERTEX_BUFFER_VIEW tessellationVertexView_{};
     D3D12_VERTEX_BUFFER_VIEW cubeVertexView_{};
     D3D12_INDEX_BUFFER_VIEW cubeIndexView_{};
+    D3D12_VERTEX_BUFFER_VIEW sphereVertexView_{};
+    D3D12_INDEX_BUFFER_VIEW sphereIndexView_{};
+    UINT sphereIndexCount_ = 0;
     D3D12_VERTEX_BUFFER_VIEW shadowInstanceView_{};
     std::vector<ComPtr<ID3D12Resource>> textures_;
     std::vector<ComPtr<ID3D12Resource>> initializationUploads_;
@@ -527,7 +534,7 @@ LRESULT CALLBACK RenderingSystem::WindowProcedure(HWND hwnd, UINT message, WPARA
         if (firstPress && wParam == 'R') {
             app->cameraPosition_ = {0.0f, 8.0f, -25.0f};
             app->cameraYaw_ = 0.0f;
-            app->cameraPitch_ = -0.12f;
+            app->cameraPitch_ = app->materialGridEnabled_ ? 0.0f : -0.12f;
         }
         if (firstPress && wParam == 'C') app->frustumCulling_ = !app->frustumCulling_;
         if (firstPress && wParam == 'O') app->octreeCulling_ = !app->octreeCulling_;
@@ -542,6 +549,12 @@ LRESULT CALLBACK RenderingSystem::WindowProcedure(HWND hwnd, UINT message, WPARA
         if (firstPress && wParam == 'J') app->vignetteEnabled_ = !app->vignetteEnabled_;
         if (firstPress && wParam == 'K') app->outlinesEnabled_ = !app->outlinesEnabled_;
         if (firstPress && wParam == 'I') app->iblEnabled_ = !app->iblEnabled_;
+        if (firstPress && wParam == 'G') {
+            app->materialGridEnabled_ = !app->materialGridEnabled_;
+            app->cameraPosition_ = {0.0f, 8.0f, -25.0f};
+            app->cameraYaw_ = 0.0f;
+            app->cameraPitch_ = app->materialGridEnabled_ ? 0.0f : -0.12f;
+        }
         if (wParam >= '1' && wParam <= '4') app->displayMode_ = static_cast<UINT>(wParam - '1');
         return 0;
     }
@@ -941,13 +954,15 @@ void RenderingSystem::CreatePipeline()
         {"TANGENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, tangent), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"INSTANCE_POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, offsetof(InstanceData, position), D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"INSTANCE_SCALE", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, offsetof(InstanceData, scale), D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
-        {"INSTANCE_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(InstanceData, color), D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}
+        {"INSTANCE_COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(InstanceData, color), D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+        {"INSTANCE_ROUGHNESS", 0, DXGI_FORMAT_R32_FLOAT, 1, offsetof(InstanceData, roughness), D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}
     };
     D3D12_GRAPHICS_PIPELINE_STATE_DESC instancingPso = pso;
     instancingPso.pRootSignature = instancingRootSignature_.Get();
     instancingPso.VS = {instancingVs->GetBufferPointer(), instancingVs->GetBufferSize()};
     instancingPso.PS = {instancingPs->GetBufferPointer(), instancingPs->GetBufferSize()};
     instancingPso.InputLayout = {instancingInput, _countof(instancingInput)};
+    instancingPso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     Check(device_->CreateGraphicsPipelineState(&instancingPso, IID_PPV_ARGS(&instancingPipeline_)),
         "Cannot create instancing pipeline state");
 
@@ -1250,6 +1265,39 @@ void RenderingSystem::LoadScene()
     cubeIndexView_ = {cubeIndexBuffer_->GetGPUVirtualAddress(),
         static_cast<UINT>(sizeof(cubeIndices)), DXGI_FORMAT_R16_UINT};
 
+    // UV sphere used by the metallic/roughness material chart.
+    constexpr UINT sphereSlices = 32;
+    constexpr UINT sphereStacks = 20;
+    std::vector<Vertex> sphereVertices;
+    std::vector<uint32_t> sphereIndices;
+    sphereVertices.reserve((sphereSlices + 1) * (sphereStacks + 1));
+    sphereIndices.reserve(sphereSlices * sphereStacks * 6);
+    for (UINT stack = 0; stack <= sphereStacks; ++stack) {
+        const float v = static_cast<float>(stack) / sphereStacks;
+        const float phi = v * XM_PI;
+        for (UINT slice = 0; slice <= sphereSlices; ++slice) {
+            const float u = static_cast<float>(slice) / sphereSlices;
+            const float theta = u * XM_2PI;
+            const XMFLOAT3 normal{sinf(phi) * cosf(theta), cosf(phi), sinf(phi) * sinf(theta)};
+            sphereVertices.push_back({normal, normal, {u, v}});
+        }
+    }
+    for (UINT stack = 0; stack < sphereStacks; ++stack) {
+        for (UINT slice = 0; slice < sphereSlices; ++slice) {
+            const uint32_t a = stack * (sphereSlices + 1) + slice;
+            const uint32_t b = a + 1;
+            const uint32_t c = a + sphereSlices + 1;
+            const uint32_t d = c + 1;
+            sphereIndices.insert(sphereIndices.end(), {a, c, b, b, c, d});
+        }
+    }
+    sphereVertexBuffer_ = CreateDefaultBuffer(sphereVertices.data(), sphereVertices.size() * sizeof(Vertex));
+    sphereIndexBuffer_ = CreateDefaultBuffer(sphereIndices.data(), sphereIndices.size() * sizeof(uint32_t));
+    sphereVertexView_ = {sphereVertexBuffer_->GetGPUVirtualAddress(),
+        static_cast<UINT>(sphereVertices.size() * sizeof(Vertex)), sizeof(Vertex)};
+    sphereIndexView_ = {sphereIndexBuffer_->GetGPUVirtualAddress(),
+        static_cast<UINT>(sphereIndices.size() * sizeof(uint32_t)), DXGI_FORMAT_R32_UINT};
+    sphereIndexCount_ = static_cast<UINT>(sphereIndices.size());
 
     std::vector<ParticleData> initialParticles(ParticleCount);
     for (UINT i = 0; i < ParticleCount; ++i) {
@@ -1490,7 +1538,7 @@ void RenderingSystem::Render()
     commandList_->ResourceBarrier(1, &particleToRead);
     particleSource_ = particleDestination;
 
-    if (shadowsEnabled_) {
+    if (shadowsEnabled_ && !materialGridEnabled_) {
         auto toDepthWrite = Transition(shadowMap_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_DEPTH_WRITE);
         commandList_->ResourceBarrier(1, &toDepthWrite);
@@ -1535,7 +1583,7 @@ void RenderingSystem::Render()
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->IASetVertexBuffers(0, 1, &vertexView_); commandList_->IASetIndexBuffer(&indexView_);
     XMMATRIX world = XMMatrixScaling(0.01f, 0.01f, 0.01f);
-    if (showSponza_) {
+    if (showSponza_ && !materialGridEnabled_) {
     for (UINT i = 0; i < model_.submeshes.size(); ++i) {
         const auto& submesh = model_.submeshes[i];
         const auto& material = model_.materials[submesh.materialIndex];
@@ -1575,27 +1623,45 @@ void RenderingSystem::Render()
     }
 
     auto* instances = reinterpret_cast<InstanceData*>(mappedInstances_[frameIndex_]);
-    for (size_t i = 0; i < visibleObjects_.size(); ++i) {
-        const SceneObject& object = sceneObjects_[visibleObjects_[i]];
-        instances[i] = {object.position, 0.0f,
-            {object.scale, object.scale, object.scale}, 0.0f, object.color};
+    UINT instanceCount = 0;
+    if (materialGridEnabled_) {
+        constexpr UINT gridSize = 7;
+        constexpr float spacing = 2.35f;
+        for (UINT row = 0; row < gridSize; ++row) {
+            for (UINT column = 0; column < gridSize; ++column) {
+                const float metallic = static_cast<float>(row) / (gridSize - 1);
+                const float roughness = 0.05f + 0.95f * static_cast<float>(column) / (gridSize - 1);
+                instances[instanceCount++] = {
+                    {(static_cast<float>(column) - 3.0f) * spacing,
+                     8.0f + (static_cast<float>(row) - 3.0f) * spacing, 5.0f}, 0.0f,
+                    {0.9f, 0.9f, 0.9f}, 0.0f, {0.82f, 0.24f, 0.07f, metallic}, roughness};
+            }
+        }
+    } else {
+        for (size_t i = 0; i < visibleObjects_.size(); ++i) {
+            const SceneObject& object = sceneObjects_[visibleObjects_[i]];
+            instances[instanceCount++] = {object.position, 0.0f,
+                {object.scale, object.scale, object.scale}, 0.0f, object.color};
+        }
+        instances[instanceCount++] = {{0.0f, -0.6f, 30.0f}, 0.0f,
+            {165.0f, 1.0f, 165.0f}, 0.0f, {0.32f, 0.34f, 0.38f, 0.0f}};
     }
-    instances[visibleObjects_.size()] = {{0.0f, -0.6f, 30.0f}, 0.0f,
-        {165.0f, 1.0f, 165.0f}, 0.0f, {0.32f, 0.34f, 0.38f, 0.0f}};
     InstancePassConstants instancePass{};
     XMStoreFloat4x4(&instancePass.viewProjection, XMMatrixTranspose(view * projection));
     memcpy(mappedInstancePass_[frameIndex_], &instancePass, sizeof(instancePass));
     D3D12_VERTEX_BUFFER_VIEW instanceView{
         instanceBuffers_[frameIndex_]->GetGPUVirtualAddress(),
-        static_cast<UINT>((visibleObjects_.size() + 1) * sizeof(InstanceData)), sizeof(InstanceData)};
-    const D3D12_VERTEX_BUFFER_VIEW instancingViews[]{cubeVertexView_, instanceView};
+        static_cast<UINT>(instanceCount * sizeof(InstanceData)), sizeof(InstanceData)};
+    const D3D12_VERTEX_BUFFER_VIEW instancingViews[]{
+        materialGridEnabled_ ? sphereVertexView_ : cubeVertexView_, instanceView};
     commandList_->SetPipelineState(instancingPipeline_.Get());
     commandList_->SetGraphicsRootSignature(instancingRootSignature_.Get());
     commandList_->SetGraphicsRootConstantBufferView(0, instancePassBuffers_[frameIndex_]->GetGPUVirtualAddress());
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->IASetVertexBuffers(0, 2, instancingViews);
-    commandList_->IASetIndexBuffer(&cubeIndexView_);
-    commandList_->DrawIndexedInstanced(36, static_cast<UINT>(visibleObjects_.size() + 1), 0, 0, 0);
+    commandList_->IASetIndexBuffer(materialGridEnabled_ ? &sphereIndexView_ : &cubeIndexView_);
+    commandList_->DrawIndexedInstanced(materialGridEnabled_ ? sphereIndexCount_ : 36,
+        instanceCount, 0, 0, 0);
 
     titleUpdateTime_ += delta;
     ++titleFrameCount_;
@@ -1604,7 +1670,9 @@ void RenderingSystem::Render()
         const wchar_t* mode = !frustumCulling_ ? L"OFF" : (octreeCulling_ ? L"OCTREE" : L"LINEAR");
         std::wostringstream title;
         const size_t culledCount = sceneObjects_.size() - visibleObjects_.size();
-        title << L"D3D12 PBR + IBL | IBL " << (iblEnabled_ ? L"ON" : L"OFF")
+        title << L"D3D12 PBR + IBL | " << (materialGridEnabled_ ? L"MATERIAL GRID" : L"SCENE")
+            << (materialGridEnabled_ ? L" (ROUGHNESS ->, METALLIC up)" : L"")
+            << L" | IBL " << (iblEnabled_ ? L"ON" : L"OFF")
             << L" | VIGNETTE " << (vignetteEnabled_ ? L"ON" : L"OFF")
             << L" | OUTLINES " << (outlinesEnabled_ ? L"ON" : L"OFF")
             << L" | PARTICLES " << (particlesEnabled_ ? L"ON" : L"OFF")
@@ -1690,7 +1758,7 @@ void RenderingSystem::Render()
             XMMatrixTranspose(cascades.viewProjection[cascade]));
     lights.cascadeSplits = {cascades.splitDistances[0], cascades.splitDistances[1],
         cascades.splitDistances[2], cascades.splitDistances[3]};
-    lights.shadowParameters = {shadowsEnabled_ ? 1.0f : 0.0f,
+    lights.shadowParameters = {(shadowsEnabled_ && !materialGridEnabled_) ? 1.0f : 0.0f,
         visualizeCascades_ ? 1.0f : 0.0f, 0.0012f, 1.0f / ShadowMapSize};
     XMStoreFloat4(&lights.cameraForward, XMVectorSetW(XMVector3Normalize(lookDirection), 0.0f));
     memcpy(mappedLights_[frameIndex_], &lights, sizeof(lights));
