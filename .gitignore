@@ -1,0 +1,8 @@
+.vs/
+out/
+build/
+*.exe
+*.pdb
+*.ilk
+*.zip
+/Textured.hlsl

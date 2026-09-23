@@ -1,0 +1,8 @@
+newmtl Wood
+Kd 1.0 1.0 1.0
+map_Kd wood.jpg
+
+newmtl Metal
+Kd 1.0 1.0 1.0
+map_Kd metal.jpg
+
